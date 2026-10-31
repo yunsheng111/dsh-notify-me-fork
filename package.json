@@ -1,0 +1,121 @@
+{
+  "name": "dsh-notify-me",
+  "version": "1.17.0",
+  "description": "离开 DSH 页面也能收到提醒：需要你操作 / 后台回复完成时发系统通知、标题标记与提示音，支持审批快捷裁决与外部推送，Web 版与桌面版均可用。",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/page-bridge.js",
+    "lib/host-fallback.js",
+    "lib/relay.js",
+    "lib/focus-window.ps1",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-web",
+    "notification",
+    "desktop-notification",
+    "notify",
+    "notifications",
+    "alerts",
+    "reminder",
+    "reminders",
+    "message-alert",
+    "needs-your-input",
+    "approval-alert",
+    "approval-actions",
+    "idle-detection",
+    "auto-dismiss",
+    "background-alert",
+    "external-notification",
+    "webhook",
+    "discord",
+    "bark",
+    "gotify",
+    "feishu",
+    "serverchan",
+    "wxpusher",
+    "push-notification",
+    "桌面通知",
+    "消息提醒",
+    "可操作提醒",
+    "审批提醒",
+    "提醒插件",
+    "需要你操作",
+    "回复完成提醒",
+    "后台完成提醒",
+    "外部通知",
+    "推送提醒",
+    "提醒",
+    "闲置判定",
+    "离开判定"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node smoke/smoke-test.cjs && node smoke/host-route-test.mjs && node smoke/page-bridge-test.mjs && node smoke/host-fallback-test.mjs && node smoke/relay-route-test.mjs && node smoke/cordis-host-test.mjs",
+    "pack": "npm pack --dry-run"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "author": "chromoany",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chromoany/dsh-notify-me.git"
+  },
+  "homepage": "https://github.com/chromoany/dsh-notify-me#readme",
+  "bugs": {
+    "url": "https://github.com/chromoany/dsh-notify-me/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.1.1-rc.2": "compatible",
+        "0.1.2-rc.1": "compatible",
+        "0.1.5-rc.1": "compatible",
+        "0.1.5-rc.2": "compatible",
+        "0.2.0-rc.2": "compatible",
+        "0.2.1-rc.2": "compatible",
+        "0.2.1-rc.3": "compatible",
+        "0.2.1-rc.4": "compatible",
+        "0.2.2-alpha.2": "compatible"
+      }
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.6 || ^0.1.1-rc.2 || ^0.1.2-rc.1 || ^0.1.5-rc.1 || >=0.1.6-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-client-locale": {
+      "optional": true
+    }
+  }
+}
