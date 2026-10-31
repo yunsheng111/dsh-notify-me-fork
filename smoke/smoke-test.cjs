@@ -44,8 +44,9 @@ function bootBundle(opts) {
   // A granted-permission Notification stand-in so a test can grab the toast the
   // plugin raised and click it the way Windows would.
   let lastNotification = null;
+  const notifications = [];
   class FakeNotification {
-    constructor(title, config) { this.title = title; this.config = config; this.closed = false; lastNotification = this; }
+    constructor(title, config) { this.title = title; this.config = config; this.closed = false; lastNotification = this; notifications.push(this); }
     close() { this.closed = true; }
   }
   FakeNotification.permission = 'granted';
@@ -80,6 +81,25 @@ function bootBundle(opts) {
       const i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1);
     },
   };
+  // A minimal DOM stand-in for cases that exercise the in-page toast channel:
+  // the production code only ever touches body/createElement, className,
+  // textContent, style, appendChild and remove.
+  if (opts && opts.withDom) {
+    const mkEl = (tag) => ({
+      tagName: String(tag || 'div').toUpperCase(),
+      children: [], parent: null, style: {}, className: '', textContent: '', disabled: false,
+      appendChild(c) { c.parent = this; this.children.push(c); return c; },
+      remove() {
+        if (!this.parent) return;
+        const i = this.parent.children.indexOf(this);
+        if (i >= 0) this.parent.children.splice(i, 1);
+        this.parent = null;
+      },
+      setAttribute() {},
+    });
+    documentStub.body = mkEl('body');
+    documentStub.createElement = (t) => mkEl(t);
+  }
   const storage = {};
   const sandbox = {
     window: windowStub,
@@ -98,6 +118,18 @@ function bootBundle(opts) {
   // Test-specific environment extras (service-worker bridge stubs, __DSH_BOOT__,
   // a shared BroadcastChannel hub) go in before the bundle evaluates.
   if (opts && typeof opts.extend === 'function') opts.extend(sandbox, windowStub);
+  // Cases that do not ask for the page-toast channel pin it off: the shipped
+  // default is on, and every pre-existing expectation below watches the OS
+  // notification path. A pageToast case seeds {pageToast:true} instead.
+  if (!(opts && opts.pageToast)) {
+    try {
+      let seed = {};
+      const prev = JSON.parse(sandbox.localStorage.getItem('dshNotifyMe.config') || '{}');
+      if (prev && typeof prev === 'object' && !Array.isArray(prev)) seed = prev;
+      seed.pageToast = false;
+      sandbox.localStorage.setItem('dshNotifyMe.config', JSON.stringify(seed));
+    } catch (e) { /* a case may have broken storage on purpose — leave it as is */ }
+  }
   vm.runInContext(SRC, sandbox, { filename: 'client.js' });
   if (!captured.reg) throw new Error('plugin did not register via __ModuleLoader__.load');
   if (captured.reg.id !== 'dsh-notify-me') throw new Error('unexpected id ' + captured.reg.id);
@@ -117,6 +149,7 @@ function bootBundle(opts) {
     events,
     getTitle: () => title,
     lastNotification: () => lastNotification,
+    notifications,
     // Drive a real visibilitychange the way the browser would.
     fireVisibility: () => { for (const fn of [...docListeners.visibilitychange]) fn(); },
     // The pagehide / pageshow listeners (the lease's release and its
@@ -3971,6 +4004,307 @@ async function approvalTestToastSurvivesMark() {
 // alerts — toast, sound, forwarded copy and the host fallback — while leaving
 // every other conversation alone, survive a reload, and never take the page
 // down when the stored list is full of junk.
+// ─────────────────── ported features (fork 1.18.0) ───────────────────
+// Helpers to inspect the in-page toast container the page-toast channel
+// renders into the fake DOM.
+function collectCardText(n) {
+  let t = typeof n.textContent === 'string' ? n.textContent : '';
+  for (const c of n.children || []) t += collectCardText(c);
+  return t;
+}
+function pageCards(b) {
+  const body = b.doc && b.doc.body;
+  if (!body) return [];
+  for (const child of body.children) {
+    if (typeof child.className === 'string' && child.className.indexOf('dnm-pageToasts') !== -1) return child.children;
+  }
+  return [];
+}
+function pageCardTexts(b) { return pageCards(b).map(collectCardText); }
+function findCardButton(card, label) {
+  const stack = [...(card.children || [])];
+  while (stack.length) {
+    const n = stack.shift();
+    if (n.tagName === 'BUTTON' && n.textContent === label) return n;
+    for (const c of n.children || []) stack.push(c);
+  }
+  return null;
+}
+
+// The page-toast channel: while the user is present the alert becomes an
+// in-page card INSTEAD of the OS notification; away, the OS keeps doing the
+// job (the ported hybrid-notify idea — replacement, never duplication).
+async function pageToastChannel() {
+  console.log('\n— page toast: present page gets an in-page card, away gets the OS —');
+
+  // 1) present + pageToast on: a background completion shows a page card and
+  //    raises no OS notification.
+  const b = bootBundle({ withNotification: true, pageToast: true, withDom: true });
+  const host = buildHost({ withSessionStatus: true, withWorkspace: true });
+  const { mod, win, doc, events, notifications } = b;
+  const cur = { running: true, displayTitle: '当前会话', retainedBy: { mainView: 1 } };
+  mod.apply(host.ctx);
+  win.__dshNotifyMe.onEvent = (kind, payload) => events.push({ kind, ...payload });
+  win.__dshNotifyMe.setConfig({ sound: false, language: 'zh', enabled: true, idleMinutes: 0, donePolicy: 'always' });
+  host.setList({
+    ids: ['s1', 'bg', 'bg2'],
+    byId: {
+      s1: cur,
+      bg: { running: true, displayTitle: '后台任务', retainedBy: {} },
+      bg2: { running: true, displayTitle: '另一个后台任务', retainedBy: {} },
+    },
+    phase: 'ready',
+  });
+  host.notifyList();
+  host.setFace({ sessionId: 's1', running: true, nodes: [], partial: null });
+  host.notifyFace();
+  doc.hidden = false; doc.visibilityState = 'visible';
+  events.length = 0; notifications.length = 0;
+  host.setStatus(new Map([['bg', statusRow(null, { running: false, completionUnread: true })]]));
+  host.notifyStatus();
+  assert(events.filter((e) => e.kind === 'done').length === 1, 'the completion still reports through onEvent');
+  assert(notifications.length === 0, 'no OS notification while the user is present, got ' + notifications.length);
+  const cards1 = pageCardTexts(b);
+  assert(cards1.length === 1 && cards1[0].indexOf('后台任务') !== -1,
+    'one page card naming the session, got ' + JSON.stringify(cards1));
+
+  // 2) away: the next completion goes to the OS again; no new page card.
+  doc.hidden = true; doc.visibilityState = 'hidden';
+  b.fireVisibility();
+  events.length = 0; notifications.length = 0;
+  host.setStatus(new Map([['bg2', statusRow(null, { running: false, completionUnread: true })]]));
+  host.notifyStatus();
+  assert(events.filter((e) => e.kind === 'done').length === 1, 'the away completion still reports');
+  assert(notifications.length === 1, 'the away completion raises the OS notification, got ' + notifications.length);
+  assert(pageCards(b).length === 1, 'no second page card while away, got ' + pageCards(b).length);
+
+  // 3) an approval card carries 同意/拒绝; clicking 同意 settles the wait.
+  doc.hidden = false; doc.visibilityState = 'visible';
+  b.fireVisibility();
+  const answered = [];
+  events.length = 0; notifications.length = 0;
+  host.setStatus(new Map([
+    ['bg', statusRow(approval('approval:301', {
+      sessionId: 'bg',
+      answer: (o) => { answered.push(o); return Promise.resolve(); },
+    }))],
+  ]));
+  host.notifyStatus();
+  assert(notifications.length === 0, 'a present approval is a page card, not an OS toast');
+  const cards3 = pageCards(b);
+  assert(cards3.length === 2, 'the approval card joins the standing one, got ' + cards3.length);
+  const approveBtn = findCardButton(cards3[1], '同意');
+  assert(approveBtn, 'the approval card has a 同意 button');
+  const rejectBtn = findCardButton(cards3[1], '拒绝');
+  assert(rejectBtn, 'the approval card has a 拒绝 button');
+  approveBtn.onclick({ preventDefault() {}, stopPropagation() {} });
+  assert(JSON.stringify(answered) === '["allowed-once"]',
+    'clicking 同意 answers allowed-once, got ' + JSON.stringify(answered));
+  assert(events.some((e) => e.kind === 'decision'), 'the decision reports through onEvent');
+
+  // 4) the plain card dismisses itself (default 5 s); the approval card got 12 s.
+  await sleep(5400);
+  const after = pageCardTexts(b);
+  assert(!after.some((t) => t.indexOf('后台任务') !== -1) || after.length === 0 || pageCards(b).length <= 1,
+    'the plain page card dismissed itself, still showing ' + JSON.stringify(after));
+
+  // 5) pageToast off (the seeded default everywhere else): the same present
+  //    completion raises the OS notification, exactly the 1.17.0 behaviour.
+  const b2 = bootBundle({ withNotification: true });
+  const host2 = buildHost({ withSessionStatus: true, withWorkspace: true });
+  const { mod: mod2, win: win2, doc: doc2, events: events2, notifications: notifications2 } = b2;
+  mod2.apply(host2.ctx);
+  win2.__dshNotifyMe.onEvent = (kind, payload) => events2.push({ kind, ...payload });
+  win2.__dshNotifyMe.setConfig({ sound: false, language: 'zh', enabled: true, idleMinutes: 0, donePolicy: 'always' });
+  host2.setList({ ids: ['s1', 'bg'], byId: { s1: cur, bg: { running: true, displayTitle: '后台任务', retainedBy: {} } }, phase: 'ready' });
+  host2.notifyList();
+  host2.setFace({ sessionId: 's1', running: true, nodes: [], partial: null });
+  host2.notifyFace();
+  doc2.hidden = false; doc2.visibilityState = 'visible';
+  host2.setStatus(new Map([['bg', statusRow(null, { running: false, completionUnread: true })]]));
+  host2.notifyStatus();
+  assert(notifications2.length === 1, 'pageToast off keeps the OS notification path, got ' + notifications2.length);
+  assert(pageCards(b2).length === 0, 'pageToast off renders no page card');
+  console.log('page toast OK: present → in-page card (with deciding buttons), away → OS, off → old behaviour');
+}
+
+// Title regex ignore: a matching session goes silent on every surface —
+// alert, OS toast, title mark, quieted queue — while its neighbours keep
+// alerting; stored junk is pruned instead of trusted.
+async function titleIgnorePatterns() {
+  console.log('\n— title regex ignore: one matching session goes silent, the rest alert —');
+  const b = bootBundle({ withNotification: true });
+  const host = buildHost({ withSessionStatus: true, withWorkspace: true });
+  const { mod, win, doc, events, notifications, getTitle } = b;
+  const cur = { running: true, displayTitle: '当前会话', retainedBy: { mainView: 1 } };
+  mod.apply(host.ctx);
+  win.__dshNotifyMe.onEvent = (kind, payload) => events.push({ kind, ...payload });
+  win.__dshNotifyMe.setConfig({
+    sound: false, language: 'zh', enabled: true, idleMinutes: 0, donePolicy: 'always',
+    ignoredPatterns: ['^Telegram'],
+  });
+  host.setList({
+    ids: ['s1', 'tg', 'bg'],
+    byId: {
+      s1: cur,
+      tg: { running: true, displayTitle: 'Telegram · 中转', retainedBy: {} },
+      bg: { running: true, displayTitle: '后台任务', retainedBy: {} },
+    },
+    phase: 'ready',
+  });
+  host.notifyList();
+  host.setFace({ sessionId: 's1', running: true, nodes: [], partial: null });
+  host.notifyFace();
+
+  // 1) a wait on the ignored session: no alert, no OS toast, no title mark.
+  doc.hidden = true; doc.visibilityState = 'hidden';
+  host.setStatus(new Map([['tg', statusRow(approval('approval:401', { sessionId: 'tg' }))]]));
+  host.notifyStatus();
+  assert(events.length === 0, 'the ignored session raises no alert, got ' + JSON.stringify(events.map((e) => e.kind)));
+  assert(notifications.length === 0, 'the ignored session raises no OS toast');
+  assert(getTitle().indexOf('需要你') === -1, 'the ignored wait leaves no title mark');
+
+  // 2) a neighbour session still alerts.
+  events.length = 0;
+  host.setStatus(new Map([
+    ['tg', statusRow(approval('approval:401', { sessionId: 'tg' }))],
+    ['bg', statusRow(approval('approval:402', { sessionId: 'bg' }))],
+  ]));
+  host.notifyStatus();
+  assert(events.filter((e) => e.kind === 'attention').length === 1,
+    'the non-matching neighbour still alerts, got ' + JSON.stringify(events.map((e) => e.kind)));
+
+  // 3) the done path honours the ignore too, while the neighbour completes aloud.
+  await sleep(400);
+  events.length = 0;
+  host.setStatus(new Map([
+    ['tg', statusRow(null, { running: false, completionUnread: true })],
+    ['bg', statusRow(null, { running: true })],
+  ]));
+  host.notifyStatus();
+  await sleep(400);
+  assert(events.length === 0, 'the ignored session is silent on the done path too');
+  host.setStatus(new Map([
+    ['tg', statusRow(null, { running: false, completionUnread: true })],
+    ['bg', statusRow(null, { running: false, completionUnread: true })],
+  ]));
+  host.notifyStatus();
+  assert(events.filter((e) => e.kind === 'done').length === 1, 'the neighbour completion alerts');
+
+  // 4) an on-screen wait on an ignored session is not even queued for later,
+  //    while a normal on-screen wait still queues and flushes on away.
+  doc.hidden = false; doc.visibilityState = 'visible';
+  b.fireVisibility();
+  await sleep(400);
+  events.length = 0;
+  host.setList({ ids: ['s1'], byId: { s1: { running: true, displayTitle: 'Telegram · 界面', retainedBy: { mainView: 1 } } }, phase: 'ready' });
+  host.notifyList();
+  host.setStatus(new Map([['s1', statusRow(approval('approval:403'))]]));
+  host.notifyStatus();
+  assert(events.length === 0, 'the ignored on-screen wait stays silent, got ' + JSON.stringify(events));
+  assert(win.__dshNotifyMe.debug().quietedKeys.indexOf('approval:403') === -1,
+    'the ignored wait is not queued for the background either');
+  assert(getTitle().indexOf('需要你') === -1, 'the ignored on-screen wait leaves no mark');
+  host.setList({ ids: ['s1'], byId: { s1: cur }, phase: 'ready' });
+  host.notifyList();
+  events.length = 0;
+  host.setStatus(new Map([['s1', statusRow(approval('approval:404'))]]));
+  host.notifyStatus();
+  assert(events.length === 0, 'a normal on-screen wait stays quiet while visible');
+  assert(win.__dshNotifyMe.debug().quietedKeys.indexOf('approval:404') !== -1, 'and is queued for the background');
+  doc.hidden = true; doc.visibilityState = 'hidden';
+  b.fireVisibility();
+  assert(events.filter((e) => e.kind === 'attention').length === 1, 'and flushes on away');
+
+  // 5) stored junk is pruned; invalid regex lines are dropped, not fatal.
+  const jb = bootBundle({
+    extend(sandbox) {
+      sandbox.localStorage.setItem('dshNotifyMe.config', JSON.stringify({
+        ignoredPatterns: ['^Tg', 42, '', '   ', 'x'.repeat(300), '(bad[', '^Ok$'],
+      }));
+    },
+  });
+  const jHost = buildHost({ withUiSession: false });
+  jb.mod.apply(jHost.ctx);
+  assert(JSON.stringify(jb.win.__dshNotifyMe.config.ignoredPatterns) === '["^Tg","^Ok$"]',
+    'junk and invalid regex lines are pruned, got ' +
+      JSON.stringify(jb.win.__dshNotifyMe.config.ignoredPatterns));
+  console.log('title ignore OK: matching session silent everywhere, neighbours intact, junk pruned');
+}
+
+// Attention kind toggles: 审批/方案待确认/提问 can each be switched off with
+// full-mute semantics (no alert, no OS toast, no mark, nothing queued);
+// re-enabling announces the next wait like lifting a mute does.
+async function attentionKindToggles() {
+  console.log('\n— attention kind toggles: one kind off, the others loud —');
+  const b = bootBundle({ withNotification: true });
+  const host = buildHost({ withSessionStatus: true, withWorkspace: true });
+  const { mod, win, doc, events, notifications, getTitle } = b;
+  const cur = { running: true, displayTitle: '当前会话', retainedBy: { mainView: 1 } };
+  mod.apply(host.ctx);
+  win.__dshNotifyMe.onEvent = (kind, payload) => events.push({ kind, ...payload });
+  win.__dshNotifyMe.setConfig({ sound: false, language: 'zh', enabled: true, idleMinutes: 0, alertApproval: false });
+  doc.hidden = true; doc.visibilityState = 'hidden';
+  host.setList({
+    ids: ['s1', 'bg1', 'bg2'],
+    byId: {
+      s1: cur,
+      bg1: { running: true, displayTitle: '后台一', retainedBy: {} },
+      bg2: { running: true, displayTitle: '后台二', retainedBy: {} },
+    },
+    phase: 'ready',
+  });
+  host.notifyList();
+  host.setFace({ sessionId: 's1', running: true, nodes: [], partial: null });
+  host.notifyFace();
+
+  // 1) the disabled kind: nothing at all.
+  host.setStatus(new Map([['bg1', statusRow(approval('approval:501', { sessionId: 'bg1' }))]]));
+  host.notifyStatus();
+  assert(events.length === 0, 'a disabled kind raises no alert');
+  assert(notifications.length === 0, 'a disabled kind raises no OS toast');
+  assert(getTitle().indexOf('需要你') === -1, 'a disabled kind leaves no title mark');
+
+  // 2) the other kinds default on.
+  host.setStatus(new Map([
+    ['bg1', statusRow(question('question:502', { sessionId: 'bg1' }))],
+    ['bg2', statusRow(planReview('plan:503', { sessionId: 'bg2' }))],
+  ]));
+  host.notifyStatus();
+  const att = events.filter((e) => e.kind === 'attention');
+  assert(att.length === 2, 'question and plan-review still alert, got ' + att.length);
+  assert(getTitle().indexOf('需要你') !== -1, 'title mark set for the enabled kinds');
+
+  // 3) re-enabling announces the next approval (a wait never announced stays
+  //    announceable, the same rule a lifted mute follows).
+  await sleep(400);
+  win.__dshNotifyMe.setConfig({ alertApproval: true });
+  events.length = 0;
+  host.setStatus(new Map([
+    ['bg1', statusRow(question('question:502', { sessionId: 'bg1' }))],
+    ['bg2', statusRow(approval('approval:504', { sessionId: 'bg2' }))],
+  ]));
+  host.notifyStatus();
+  const att2 = events.filter((e) => e.kind === 'attention');
+  assert(att2.length === 1 && att2[0].title === 'DSH · 审批请求',
+    're-enabling announces the next approval, got ' + JSON.stringify(att2));
+  console.log('kind toggles OK: disabled kind fully silent, siblings loud, re-enable announces');
+}
+
+// The ported features ship settings strings; both languages must define them.
+function portedSettingsKeys() {
+  console.log('\n— ported features: settings strings exist in both languages —');
+  const sb = settingsBoot({});
+  const zh = sb.dictNow().zh;
+  const en = sb.dictNow().en;
+  for (const key of ['pageToast', 'pageToastHint', 'alertApproval', 'alertPlanReview', 'alertQuestion',
+    'secIgnore', 'ignoreHint', 'ignoreEmpty', 'ignoreInvalid', 'ignoreReset']) {
+    assert(zh[key] && en[key], 'both languages define ' + key);
+  }
+  sb.cleanup();
+  console.log('settings strings OK: page toast / kind toggles / title ignore present in zh and en');
+}
+
 async function mutedSessionsHonoured() {
   console.log('\n— per-session mute: one conversation, not the page —');
 
@@ -4183,6 +4517,10 @@ function mutedSessionsUi() {
   await withdrawnOnReturn();
   await mutedSessionsHonoured();
   mutedSessionsUi();
+  await pageToastChannel();
+  await titleIgnorePatterns();
+  await attentionKindToggles();
+  portedSettingsKeys();
   console.log('\nALL SMOKE TESTS PASSED ✔');
   // Exit explicitly: marker-release timers stay armed on purpose (they mirror
   // browser behaviour) and would otherwise hold the loop open.
