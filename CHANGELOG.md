@@ -2,6 +2,24 @@
 
 All notable changes to **dsh-notify-me** are documented here.
 
+## [1.19.0-fork.1] — 2026-11-01
+
+Fork release：给其他客户端插件开一个**通知投递入口**，不改任何既有判定。
+
+### 新增
+
+- **window.__dshNotifyMe.notify(options)**：第三方插件可以借这个插件的通知通道发一条提醒，而不是自己再造一套浮层。options = { kind?: 'done'|'attention', title, body, sessionId?, onClick? }，返回 { shown, reason?, kind?, sessionId? } 让调用方区分「已发出」和「被设置关闭」——这两件事对排查的意义完全不同。
+  - 复用既有 deliver()，因此**所有既有闸门原样生效**：总开关、按类型开关、会话静音、正则忽略、免打扰、声音、标题标记、外部转发、页内卡片替代系统通知。
+  - kind 限定为既有两个通道，设置页里「按类型开关」的含义因此不会被稀释。
+  - sessionId 给了就默认「点通知跳到该会话」（走既有 ocusSession）；onClick 给了就覆盖默认行为。
+  - 页内卡片也支持整卡点击（不只是系统通知），否则调用方的 onClick 只在开了系统通知的用户那里生效。
+
+### 内部
+
+- deliver() / showToast() / showPageToast() 增加可选的第 6 个参数 xtra。原生提醒不传，行为完全不变；只有 pi.notify() 走这条新路径。
+- 版本号 1.18.0-fork.1 → 1.19.0-fork.1，pi.version 同步。
+
+上游 smoke 全绿（page toast / kind toggles / lease / route / relay）。
 ## [1.18.0-fork.1] — 2026-10-31
 
 Fork release（本机移植版，基于上游 1.17.0）：把 dsh-hybrid-notify 的三项独有能力移植进来，全部挂进 `fire()` / `alertMutedFor()` 既有闸门，不新增分发路径。
